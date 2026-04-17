@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Conda environment
+env/
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Data - raw files (too large for GitHub)
+data/raw/
+
+# MySQL credentials (never push these)
+.env
+

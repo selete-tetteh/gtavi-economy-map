@@ -1,0 +1,17 @@
+name: gtavi-economy-map
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - pandas
+      - numpy
+      - scikit-learn
+      - matplotlib
+      - seaborn
+      - streamlit
+      - requests
+      - mysql-connector-python
+      - python-dotenv
