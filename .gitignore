@@ -2,15 +2,19 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 .Python
 
-# Conda environment
-env/
+# Conda / Virtual environments
 .env
-*.env
+*.egg-info/
+
+# Environment variables (NEVER commit this - contains passwords)
+.env
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
 # VS Code
 .vscode/
@@ -18,9 +22,9 @@ env/
 # macOS
 .DS_Store
 
-# Data - raw files (too large for GitHub)
+# Data (raw files can be large and contain sensitive info)
 data/raw/
+data/processed/
 
-# MySQL credentials (never push these)
-.env
-
+# Logs
+*.log
