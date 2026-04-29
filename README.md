@@ -58,6 +58,8 @@ streamlit run app.py
 ```
 
 ## Project Structure
+
+```
 gtavi-economy-map/ 
 ├── data/ 
 │ ├── raw/ 
@@ -67,6 +69,7 @@ gtavi-economy-map/
 ├── app.py # Streamlit dashboard
 ├── environment.yml 
 └── README.md
+```
 
 ## Model Limitations
 
