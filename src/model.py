@@ -1,246 +1,161 @@
 """
 model.py
 --------
-Builds a linear regression model to predict GTA VI launch pricing.
+Trains a linear regression model to predict GTA VI launch pricing.
 
-Reads from the master_dataset table in MySQL, engineers features,
-trains a linear regression model, evaluates it, and prints the
-GTA VI price prediction with a confidence interval.
+Reads from master_dataset in MySQL, trains on 42 historical AAA
+game titles across 5 publishers (2007-2023), and outputs a price
+prediction with confidence interval for GTA VI (2026).
 
 Why linear regression?
-With only 7 data points, complex models like random forests or
-neural networks would overfit badly — they would memorise the
-training data rather than learn a generalizable pattern.
-Linear regression is transparent, explainable, and appropriate
-for small structured datasets with a clear numeric target.
-Being able to explain your model choice is as important as
-the model itself, particularly in interviews.
+With 42 data points and a clear numeric target, linear regression
+is the appropriate tool. It is transparent, explainable, and
+directly defensible. Complex models would overfit on this dataset.
 
-Features used:
-- release_year: captures the time trend in pricing
-- inflation_multiplier: captures the real purchasing power context
-- gross_margin_pct: captures Take-Two's financial health at launch time
+Features:
+- release_year:          time trend in pricing
+- platform_generation:   console era effect (1/2/3)
+- inflation_multiplier:  real purchasing power context
+- had_premium_edition:   whether a premium tier existed
 
-Target variable:
-- base_price_real: inflation-adjusted base launch price in 2025 dollars
-  We predict in real terms then convert back to nominal at the end.
+Target: base_price_real (inflation-adjusted 2025 dollars)
+Prediction is converted back to nominal at the end.
+
+Evaluation: Leave-One-Out cross-validation.
+With 42 data points, LOO provides the most honest error estimate.
 """
 
 import pandas as pd
 import numpy as np
+import os
+from dotenv import load_dotenv
+from urllib.parse import quote_plus
 from sqlalchemy import create_engine
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import LeaveOneOut
-import os
-from dotenv import load_dotenv
 
 load_dotenv()
 
 
 def get_engine():
-    """
-    Create a SQLAlchemy engine for MySQL.
-    Passwords containing special characters must be URL-encoded
-    so SQLAlchemy parses the connection string correctly.
-    """
-    from urllib.parse import quote_plus
-    user = os.getenv("DB_USER")
+    """SQLAlchemy engine for pandas read operations."""
     password = quote_plus(os.getenv("DB_PASSWORD"))
-    host = os.getenv("DB_HOST")
-    database = os.getenv("DB_NAME")
-    return create_engine(f"mysql+mysqlconnector://{user}:{password}@{host}/{database}")
+    return create_engine(
+        f"mysql+mysqlconnector://{os.getenv('DB_USER')}:{password}"
+        f"@{os.getenv('DB_HOST')}/{os.getenv('DB_NAME')}"
+    )
 
 
-def load_master_dataset(engine):
-    """
-    Load the master dataset from MySQL.
-    We exclude the GTA V Next-Gen re-release from modelling —
-    it was a discounted port, not a new title, and would skew
-    the model's understanding of new release pricing.
-    """
-    query = """
-        SELECT
-            game_title,
-            release_year,
-            base_price_real,
-            premium_price_real,
-            inflation_multiplier,
-            gross_margin_pct
+def load_data():
+    """Load master dataset and CPI data from MySQL."""
+    engine = get_engine()
+    df = pd.read_sql("""
+        SELECT game_title, publisher, release_year, platform_generation,
+               had_premium_edition, base_price_nominal, base_price_real,
+               premium_price_nominal, premium_price_real, inflation_multiplier
         FROM master_dataset
-        WHERE game_title != 'Grand Theft Auto V (Next-Gen)'
         ORDER BY release_year
+    """, engine)
+    df_cpi = pd.read_sql(
+        "SELECT year, annual_cpi FROM cpi_data ORDER BY year", engine
+    )
+    return df, df_cpi
+
+
+def train_model(df):
     """
-    df = pd.read_sql(query, engine)
-    print(f"Loaded {len(df)} records for modelling")
-    print(f"Years covered: {df['release_year'].min()} to {df['release_year'].max()}")
-    return df
-
-
-def engineer_features(df):
+    Train linear regression model using LOO cross-validation for evaluation.
+    Returns the trained model and LOO MAE.
     """
-    Prepare the feature matrix (X) and target vector (y).
+    features = ["release_year", "platform_generation", "inflation_multiplier", "had_premium_edition"]
+    target = "base_price_real"
 
-    We drop rows with missing values in any feature column.
-    For this dataset that means rows without Take-Two financial
-    data (2008 and 2010) will be excluded from the financial
-    feature but included in simpler feature sets.
+    X = df[features]
+    y = df[target]
 
-    Two models are trained:
-    - Model A: year + inflation only (uses all 6 records)
-    - Model B: year + inflation + gross margin (uses records with financial data)
-
-    This is honest modelling — we do not impute or guess missing values
-    for a dataset this small. We acknowledge the limitation and train
-    on what we have.
-    """
-    # Model A features — no financial data required
-    X_a = df[["release_year", "inflation_multiplier"]].copy()
-    y = df["base_price_real"].copy()
-
-    # Model B features — requires gross margin
-    df_b = df.dropna(subset=["gross_margin_pct"])
-    X_b = df_b[["release_year", "inflation_multiplier", "gross_margin_pct"]].copy()
-    y_b = df_b["base_price_real"].copy()
-
-    print(f"\nModel A: {len(X_a)} records (year + inflation)")
-    print(f"Model B: {len(X_b)} records (year + inflation + gross margin)")
-
-    return X_a, y, X_b, y_b, df_b
-
-
-def evaluate_model(model, X, y, model_name):
-    """
-    Evaluate model performance using Leave-One-Out cross validation.
-
-    With only 6-7 data points, a standard train/test split would
-    leave too few records in either set to be meaningful.
-    Leave-One-Out (LOO) cross validation trains on all records
-    except one, predicts the held-out record, then repeats for
-    every record. This gives the most honest performance estimate
-    for very small datasets.
-    """
     loo = LeaveOneOut()
-    predictions = []
-    actuals = []
+    loo_preds, loo_actuals = [], []
 
-    X_arr = X.values
-    y_arr = y.values
-
-    for train_idx, test_idx in loo.split(X_arr):
-        X_train, X_test = X_arr[train_idx], X_arr[test_idx]
-        y_train, y_test = y_arr[train_idx], y_arr[test_idx]
-
+    for train_idx, test_idx in loo.split(X.values):
         m = LinearRegression()
-        m.fit(X_train, y_train)
-        predictions.append(m.predict(X_test)[0])
-        actuals.append(y_test[0])
+        m.fit(X.values[train_idx], y.values[train_idx])
+        loo_preds.append(m.predict(X.values[test_idx])[0])
+        loo_actuals.append(y.values[test_idx][0])
 
-    mae = mean_absolute_error(actuals, predictions)
-
-    # Train final model on all data for prediction
+    model = LinearRegression()
     model.fit(X, y)
-    r2 = r2_score(y, model.predict(X))
 
-    print(f"\n{model_name} Performance:")
-    print(f"  R-squared:           {r2:.4f}")
-    print(f"  Mean Absolute Error: ${mae:.2f} (LOO cross-validation)")
-    print(f"  Interpretation: On average, predictions are ${mae:.2f} off in 2025 dollar terms")
+    mae = mean_absolute_error(loo_actuals, loo_preds)
+    r2_train = r2_score(y, model.predict(X))
+    r2_loo = r2_score(loo_actuals, loo_preds)
+
+    print("Model Performance:")
+    print(f"  R-squared (training): {r2_train:.4f}")
+    print(f"  R-squared (LOO):      {r2_loo:.4f}")
+    print(f"  MAE (LOO):            ${mae:.2f} in 2025 dollar terms")
 
     return model, mae
 
 
-def predict_gtavi(model_a, model_b, mae_a, mae_b, cpi_df):
+def predict_gtavi(model, mae, df, df_cpi):
     """
-    Generate GTA VI price predictions using both models.
+    Generate GTA VI price prediction for 2026.
 
-    Assumptions for GTA VI (2026):
-    - release_year: 2026
-    - inflation_multiplier: CPI_2025 / CPI_2026_estimate
-      We estimate 2026 CPI by applying the average annual CPI
-      growth rate from the last 5 years to 2025's value.
-    - gross_margin_pct: We use Take-Two's FY2025 gross margin (54.35%)
-      as the most recent available figure.
-
-    Predictions are made in real (2025) dollar terms then converted
-    back to nominal 2026 dollars for the final price estimate.
+    2026 CPI is estimated using the 5-year average annual growth rate.
+    This is more conservative than using only the most recent year.
     """
-    # Estimate 2026 CPI using recent inflation trend
-    recent_cpi = cpi_df.tail(5)
-    avg_annual_growth = (
-        (recent_cpi["annual_cpi"].iloc[-1] / recent_cpi["annual_cpi"].iloc[0])
-        ** (1 / (len(recent_cpi) - 1)) - 1
+    recent = df_cpi.tail(5)
+    avg_growth = (
+        (recent["annual_cpi"].iloc[-1] / recent["annual_cpi"].iloc[0])
+        ** (1 / (len(recent) - 1)) - 1
     )
-    cpi_2025 = cpi_df["annual_cpi"].iloc[-1]
-    cpi_2026_estimate = round(cpi_2025 * (1 + avg_annual_growth), 3)
-    inflation_multiplier_2026 = round(cpi_2025 / cpi_2026_estimate, 4)
+    cpi_2025 = df_cpi.loc[df_cpi["year"] == 2025, "annual_cpi"].values[0]
+    cpi_2026 = cpi_2025 * (1 + avg_growth)
+    multiplier_2026 = round(cpi_2025 / cpi_2026, 4)
 
-    print(f"\nGTA VI Prediction Assumptions:")
-    print(f"  Estimated 2026 CPI:         {cpi_2026_estimate}")
-    print(f"  Inflation multiplier (2026): {inflation_multiplier_2026}")
-    print(f"  Average annual CPI growth:  {avg_annual_growth*100:.2f}%")
+    X_pred = pd.DataFrame([[2026, 3, multiplier_2026, 1]],
+                           columns=["release_year", "platform_generation",
+                                    "inflation_multiplier", "had_premium_edition"])
+    pred_real = model.predict(X_pred)[0]
+    pred_nominal = round(pred_real / multiplier_2026, 2)
+    mae_nominal = round(mae / multiplier_2026, 2)
 
-    # Model A prediction
-    X_gtavi_a = np.array([[2026, inflation_multiplier_2026]])
-    pred_a_real = model_a.predict(X_gtavi_a)[0]
-    pred_a_nominal = round(pred_a_real / inflation_multiplier_2026, 2)
+    gen3_premium = df[
+        (df["platform_generation"] == 3) &
+        (df["had_premium_edition"] == 1) &
+        (df["premium_price_nominal"].notna())
+    ].copy()
+    avg_gap = (gen3_premium["premium_price_nominal"] - gen3_premium["base_price_nominal"]).mean()
+    pred_premium = round(pred_nominal + avg_gap, 2)
 
-    # Model B prediction
-    gross_margin_2026 = 54.35
-    X_gtavi_b = np.array([[2026, inflation_multiplier_2026, gross_margin_2026]])
-    pred_b_real = model_b.predict(X_gtavi_b)[0]
-    pred_b_nominal = round(pred_b_real / inflation_multiplier_2026, 2)
-
-    # Convert MAE to nominal for confidence intervals
-    mae_a_nominal = round(mae_a / inflation_multiplier_2026, 2)
-    mae_b_nominal = round(mae_b / inflation_multiplier_2026, 2)
-
-    print(f"\nGTA VI Base Price Predictions:")
-    print(f"  Model A (year + inflation):")
-    print(f"    Real (2025 $):   ${pred_a_real:.2f}")
-    print(f"    Nominal (2026 $): ${pred_a_nominal:.2f}")
-    print(f"    Range:           ${pred_a_nominal - mae_a_nominal:.2f} to ${pred_a_nominal + mae_a_nominal:.2f}")
-
-    print(f"\n  Model B (+ gross margin):")
-    print(f"    Real (2025 $):   ${pred_b_real:.2f}")
-    print(f"    Nominal (2026 $): ${pred_b_nominal:.2f}")
-    print(f"    Range:           ${pred_b_nominal - mae_b_nominal:.2f} to ${pred_b_nominal + mae_b_nominal:.2f}")
-
-    return {
-        "model_a_nominal": pred_a_nominal,
-        "model_b_nominal": pred_b_nominal,
-        "mae_a_nominal": mae_a_nominal,
-        "mae_b_nominal": mae_b_nominal,
-        "cpi_2026_estimate": cpi_2026_estimate,
-        "inflation_multiplier_2026": inflation_multiplier_2026
+    result = {
+        "pred_real":        round(pred_real, 2),
+        "pred_nominal":     pred_nominal,
+        "pred_premium":     pred_premium,
+        "mae_nominal":      mae_nominal,
+        "low":              round(pred_nominal - mae_nominal, 2),
+        "high":             round(pred_nominal + mae_nominal, 2),
+        "cpi_2026":         round(cpi_2026, 3),
+        "multiplier_2026":  multiplier_2026,
+        "avg_growth_pct":   round(avg_growth * 100, 2)
     }
+
+    print("\nGTA VI Prediction:")
+    print(f"  Base edition (nominal 2026): ${result['pred_nominal']}")
+    print(f"  Premium edition:             ${result['pred_premium']}")
+    print(f"  Confidence range:            ${result['low']} - ${result['high']}")
+
+    return result
 
 
 def run():
-    engine = get_engine()
-
-    # Load data
-    df = load_master_dataset(engine)
-    cpi_df = pd.read_sql(
-        "SELECT year, annual_cpi FROM cpi_data ORDER BY year",
-        engine
-    )
-
-    # Engineer features
-    X_a, y_a, X_b, y_b, df_b = engineer_features(df)
-
-    # Train and evaluate both models
-    model_a = LinearRegression()
-    model_b = LinearRegression()
-
-    model_a, mae_a = evaluate_model(model_a, X_a, y_a, "Model A (year + inflation)")
-    model_b, mae_b = evaluate_model(model_b, X_b, y_b, "Model B (year + inflation + gross margin)")
-
-    # Generate GTA VI predictions
-    predictions = predict_gtavi(model_a, model_b, mae_a, mae_b, cpi_df)
-
-    print("\nPhase 3 complete. Predictions ready for dashboard.")
-    return model_a, model_b, predictions, df, cpi_df
+    df, df_cpi = load_data()
+    print(f"Loaded {len(df)} records for modelling")
+    model, mae = train_model(df)
+    prediction = predict_gtavi(model, mae, df, df_cpi)
+    print("\nmodel.py complete")
+    return model, mae, prediction, df, df_cpi
 
 
 if __name__ == "__main__":
